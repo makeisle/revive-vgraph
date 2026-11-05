@@ -1,0 +1,29 @@
+[package]
+name = "vgraph-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "revive-vgraph 로컬 조작 CLI — 버저닝·브랜칭 그래프를 터미널에서."
+
+# 명령줄 본체. `vgraph` 바이너리는 이 라이브러리의 `run_cli()` 를 부를 뿐이고, 다른 프로그램도 같은 함수를 불러 쓸 수 있다.
+[lib]
+name = "vgraph_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vgraph"
+path = "src/main.rs"
+
+[dependencies]
+vgraph-core.workspace = true
+vgraph-engine.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+smol_str.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true
+vgraph-mcp = { path = "../../crates/vgraph-mcp" }
+chrono.workspace = true

@@ -1,0 +1,164 @@
+# 배포 바이너리 빌드 — vgraph(CLI) + vgraph-mcp(MCP stdio 서버).
+#
+# macOS 빌드는 Apple SDK가 필요해 윈도우·리눅스에서 교차 빌드할 수 없다 →
+# macos 러너가 유일한 경로이고, 그래서 이 워크플로가 필요하다.
+# 리눅스는 도커로도 로컬 빌드 가능(scripts/build-linux.sh)이지만 여기서 같이 뽑는다.
+#
+# rusqlite가 `bundled` 피처라 타깃마다 **C 컴파일러**가 필요하다 —
+# 교차 타깃에서 linker/CC를 지정하는 이유가 이것.
+#
+# - 태그(vX.Y.Z)와 워크스페이스 버전(Cargo.toml)이 다르면 바이너리가 아는 버전이 어긋나므로 빌드 전에 실패시킨다.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          # 정적 링크 — glibc 버전에 묶이지 않는 배포본
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            apt: musl-tools
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            apt: gcc-aarch64-linux-gnu
+          # macos-latest = Apple Silicon 러너 (arm64 네이티브, x86_64는 교차)
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 바이너리가 아는 버전(Cargo.toml)과 릴리스 태그가 같아야 한다.
+      - name: Check tag matches the workspace version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version="$(awk '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p && /^version[ ]*=/{gsub(/^version[ ]*=[ ]*"|"[ \r]*$/,""); print; exit}' Cargo.toml)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ -z "$cargo_version" ] || [ "$cargo_version" != "$tag_version" ]; then
+            echo "::error::tag '$GITHUB_REF_NAME' does not match workspace version '$cargo_version' in Cargo.toml"
+            exit 1
+          fi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross toolchain
+        if: matrix.apt != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: Configure cross linker/CC
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> "$GITHUB_ENV"
+
+      - name: Configure cross linker/CC (aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Build
+        shell: bash
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} -p vgraph-cli -p vgraph-mcp
+
+      # 교차 타깃은 실행할 수 없으므로 네이티브에서만 연막 테스트.
+      # 자립성 검증: 임시 디렉터리에 그래프를 만들고 커밋까지 — 외부 서비스 0.
+      - name: Smoke test (native only)
+        if: matrix.target != 'aarch64-unknown-linux-gnu' && matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          bin=target/${{ matrix.target }}/release/vgraph
+          [ "${{ runner.os }}" = "Windows" ] && bin="$bin.exe"
+          mcp=target/${{ matrix.target }}/release/vgraph-mcp
+          [ "${{ runner.os }}" = "Windows" ] && mcp="$mcp.exe"
+
+          # 바이너리가 아는 버전이 릴리스 태그와 같은지.
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            [ "$("$bin" --version)" = "vgraph ${GITHUB_REF_NAME#v}" ] || { echo "::error::vgraph --version does not report the tag version"; exit 1; }
+            [ "$("$mcp" --version)" = "vgraph-mcp ${GITHUB_REF_NAME#v}" ] || { echo "::error::vgraph-mcp --version does not report the tag version"; exit 1; }
+          fi
+
+          "$bin" --root "$RUNNER_TEMP/vg" init smoke/ci
+          "$bin" --root "$RUNNER_TEMP/vg" add-node smoke/ci --label Cap --slug c1 --prop name=hello
+          "$bin" --root "$RUNNER_TEMP/vg" commit smoke/ci -m ci
+          "$bin" --root "$RUNNER_TEMP/vg" log smoke/ci
+
+          echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
+            | "$mcp" --root "$RUNNER_TEMP/vg-mcp" | grep -q vgraph_commit
+
+      # 릴리스 보관용 압축본(dist/)을 만든다.
+      - name: Package
+        shell: bash
+        run: |
+          name="vgraph-${{ github.ref_type == 'tag' && github.ref_name || github.sha }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/${{ matrix.target }}/release/vgraph.exe \
+               target/${{ matrix.target }}/release/vgraph-mcp.exe "dist/$name/"
+          else
+            cp target/${{ matrix.target }}/release/vgraph \
+               target/${{ matrix.target }}/release/vgraph-mcp "dist/$name/"
+          fi
+          cp README.md "dist/$name/" 2>/dev/null || true
+          cp LICENSE "dist/$name/"
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "$name.zip" "$name" > /dev/null
+          else
+            tar czf "$name.tar.gz" "$name"
+          fi
+
+      # @actions/glob은 brace 확장을 지원하지 않는다 — 패턴을 따로 쓴다
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            Unsigned — on macOS, allow it manually on first run (no signing certificate).
+            미서명 — macOS는 처음 실행 시 수동 허용 필요(서명 인증서 없음).

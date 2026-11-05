@@ -1,0 +1,17 @@
+[package]
+name = "vgraph-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "revive-vgraph 스토리지: StorageBackend 6-trait + SQLite 백엔드 + conformance 스위트."
+
+[dependencies]
+vgraph-core.workspace = true
+smol_str.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

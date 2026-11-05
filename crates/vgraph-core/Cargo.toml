@@ -1,0 +1,15 @@
+[package]
+name = "vgraph-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "revive-vgraph 코어: LPG 모델, 가역 delta, canonical 직렬화/해시, 주소. IO 없음."
+
+[dependencies]
+smol_str.workspace = true
+ulid.workspace = true
+sha2.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true

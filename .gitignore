@@ -1,0 +1,20 @@
+/target
+# 배포 산출물 — 빌드로 재생성된다 (scripts/build-linux.sh, .github/workflows/release.yml)
+/dist
+# 로컬 실행으로 생기는 그래프 저장소
+/vgraph-data
+
+# 일반 빌드 산출물
+target/
+node_modules/
+dist/
+build/
+.gradle/
+.idea/
+.vscode/
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db

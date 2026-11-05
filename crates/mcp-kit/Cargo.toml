@@ -1,0 +1,31 @@
+[package]
+name = "mcp-kit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "미니멀 MCP stdio 서버 골격 (newline JSON-RPC 2.0) — vgraph-mcp에서 추출한 공용 프로토콜 계층"
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"], optional = true }
+getrandom = { version = "0.3", optional = true }
+hyper = { version = "1.11.1", default-features = false, features = ["http1", "server"], optional = true }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio", "service", "server", "http1"], optional = true }
+serde_json.workspace = true
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "sync", "signal", "time", "macros"], optional = true }
+rustls-pki-types = { version = "1", default-features = false, features = ["std"], optional = true }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"], optional = true }
+
+[features]
+# MCP Streamable HTTP 전송(`mcp_kit::http`). 끄면 tokio·axum·getrandom이 의존성에서 빠진다.
+http = ["dep:tokio", "dep:axum", "dep:getrandom"]
+# 내장 TLS(rustls + ring). `http` 안의 하위 기능이라 끄면 TLS 의존성이 빠지고 `http`만 쓸 때와 같다.
+tls = ["http", "dep:tokio-rustls", "dep:rustls-pki-types", "dep:hyper", "dep:hyper-util"]
+
+[dev-dependencies]
+ureq.workspace = true
+# 통합 시험이 `http` 기능을 켜도록 자기 자신을 dev-dependency로 건다(워크스페이스 기본 시험에 포함시키기 위함)
+mcp-kit = { path = ".", features = ["http", "tls"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "ring", "pem"] }
+tempfile.workspace = true
