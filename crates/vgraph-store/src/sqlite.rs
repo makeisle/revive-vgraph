@@ -8,6 +8,10 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Mutex;
 use vgraph_core::{Hash256, Uuid, WorkingId};
 
+/// 격리된 작업본의 `owner` 앞에 붙는 표지. 사용자 이름에 쓰일 수 없는 문자(레코드 구분자)를
+/// 포함해 실제 소유자와 겹치지 않는다. 격리는 `owner` 값만 바꾸고 스키마는 그대로 둔다.
+const QUARANTINE_PREFIX: &str = "\u{1e}quarantined\u{1e}";
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS blobs      ( hash TEXT PRIMARY KEY, bytes BLOB NOT NULL );
 CREATE TABLE IF NOT EXISTS refs       ( branch TEXT PRIMARY KEY, head TEXT NOT NULL );
@@ -450,6 +454,17 @@ impl WalStore for SqliteBackend {
             params![w.to_string()],
         )?;
         Ok(())
+    }
+
+    fn quarantine_wal(&self, w: WorkingId) -> StoreResult<bool> {
+        // owner 열 값 앞에 표지를 붙인다. 소유자별 목록(`owner=?`)에서 빠지고 행은 그대로 남는다.
+        // 이미 격리된 행은 건드리지 않는다(멱등).
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE working SET owner = ?1 || owner WHERE temp_id=?2 AND substr(owner, 1, length(?1)) <> ?1",
+            params![QUARANTINE_PREFIX, w.to_string()],
+        )?;
+        Ok(changed > 0)
     }
 }
 

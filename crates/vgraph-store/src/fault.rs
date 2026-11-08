@@ -5,9 +5,14 @@
 //! - AfterDeltaBeforeCas → blob은 써지고 cas_ref 직전 크래시
 //! - AfterCas            → cas는 적용되고 응답 직전 크래시
 //!
+//! `CrashPoint`(api.rs) 밖의 고장 지점 둘은 별도 무장 함수로 둔다 (`CrashPoint` 변경은 이 모듈 범위 밖):
+//! - arm_after_upsert_head → upsert_head를 적용한 뒤 오류 반환 (발행 도중 끊김, P2)
+//! - arm_drop_wal_fails    → drop_wal이 오류 반환 (작업본 정리 실패, H-C4)
+//!
 //! 논리 절단 시뮬레이션 — 물리 fsync 검증은 P3의 프로세스 kill E2E 소관 (계획 §5).
 
 use crate::api::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Mutex;
 use vgraph_core::{Hash256, Uuid, WorkingId};
@@ -15,6 +20,8 @@ use vgraph_core::{Hash256, Uuid, WorkingId};
 pub struct FaultBackend<B> {
     inner: B,
     crash: Mutex<Option<CrashPoint>>,
+    after_upsert_head: AtomicBool,
+    drop_wal_fails: AtomicBool,
 }
 
 impl<B> FaultBackend<B> {
@@ -22,13 +29,25 @@ impl<B> FaultBackend<B> {
         FaultBackend {
             inner,
             crash: Mutex::new(None),
+            after_upsert_head: AtomicBool::new(false),
+            drop_wal_fails: AtomicBool::new(false),
         }
     }
     pub fn arm(&self, p: CrashPoint) {
         *self.crash.lock().unwrap() = Some(p);
     }
+    /// 다음 `upsert_head`부터 적용은 하되 오류를 돌려준다 (`disarm`까지).
+    pub fn arm_after_upsert_head(&self) {
+        self.after_upsert_head.store(true, Ordering::SeqCst);
+    }
+    /// `drop_wal`이 오류를 돌려준다 (`disarm`까지). 작업본은 지워지지 않는다.
+    pub fn arm_drop_wal_fails(&self) {
+        self.drop_wal_fails.store(true, Ordering::SeqCst);
+    }
     pub fn disarm(&self) {
         *self.crash.lock().unwrap() = None;
+        self.after_upsert_head.store(false, Ordering::SeqCst);
+        self.drop_wal_fails.store(false, Ordering::SeqCst);
     }
     pub fn into_inner(self) -> B {
         self.inner
@@ -106,7 +125,14 @@ impl<B: PayloadStore> PayloadStore for FaultBackend<B> {
 
 impl<B: HeadProvision> HeadProvision for FaultBackend<B> {
     fn upsert_head(&self, branch: &str, rows: &LinkRows) -> StoreResult<()> {
-        self.inner.upsert_head(branch, rows)
+        self.inner.upsert_head(branch, rows)?;
+        if self.after_upsert_head.load(Ordering::SeqCst) {
+            // 적용은 내구성 있게 끝난 뒤 응답만 유실
+            return Err(StoreError::Backend(
+                "injected: crash after upsert_head".into(),
+            ));
+        }
+        Ok(())
     }
     fn scan_nodes(&self, branch: &str) -> StoreResult<Vec<NodeRow>> {
         self.inner.scan_nodes(branch)
@@ -139,7 +165,13 @@ impl<B: WalStore> WalStore for FaultBackend<B> {
         self.inner.list_wals(owner)
     }
     fn drop_wal(&self, w: WorkingId) -> StoreResult<()> {
+        if self.drop_wal_fails.load(Ordering::SeqCst) {
+            return Err(StoreError::Backend("injected: drop_wal failed".into()));
+        }
         self.inner.drop_wal(w)
+    }
+    fn quarantine_wal(&self, w: WorkingId) -> StoreResult<bool> {
+        self.inner.quarantine_wal(w)
     }
 }
 

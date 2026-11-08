@@ -256,7 +256,23 @@ impl Engine {
             commit_lock: Mutex::new(()),
             sessions: Mutex::new(HashMap::new()),
         });
-        self.inner.graphs.lock().unwrap().insert(id, ctx.clone());
+        {
+            let mut graphs = self.inner.graphs.lock().unwrap();
+            if let Some(existing) = graphs.get(&id) {
+                return Ok(existing.clone()); // 동시에 연 다른 호출이 먼저 등록함
+            }
+            graphs.insert(id, ctx.clone());
+        }
+        if self.inner.opts.auto_upsert_head {
+            // 커밋 잠금 아래에서 따라잡는다: 이 그래프의 첫 커밋·병합은 끝날 때까지 기다린다.
+            let _serial = ctx.commit_lock.lock().unwrap();
+            // 실패해도 열기를 막지 않는다 — 읽기는 권위 계층(ref·블롭)만으로 정확하고,
+            // 다음 발행(`publish_state`)이 워터마크 불일치를 다시 검사해 같은 따라잡기를 한다.
+            // 표준 출력은 stdio MCP 프로토콜 채널이므로 경고는 표준 오류로만 낸다.
+            if let Err(e) = self.catch_up_derived(&ctx) {
+                eprintln!("vgraph: warn: 그래프 {id} 읽기 색인 따라잡기 실패(열기는 계속): {e}");
+            }
+        }
         Ok(ctx)
     }
 
@@ -353,12 +369,186 @@ impl Engine {
         }
 
         // 폴백: 불변 blob만 읽는 root fold (경합 불가)
+        Self::fold_chain(ctx, &chain)
+    }
+
+    /// 불변 blob만 읽어 체인을 root부터 접는다. 읽기 색인(rows·워터마크)을 쓰지 않으므로
+    /// 파생 계층이 어긋나 있어도 정확하다 — 따라잡기(`reflect_full`)의 근거 상태가 이것이다.
+    fn fold_chain(ctx: &GraphCtx, chain: &[(Hash256, Commit)]) -> EngineResult<GraphState> {
         let mut state = GraphState::new();
-        for i in (0..chain.len()).rev() {
-            let d = Self::load_delta(&ctx.backend, &chain[i].1.delta)?;
+        for (_, commit) in chain.iter().rev() {
+            let d = Self::load_delta(&ctx.backend, &commit.delta)?;
             apply(&mut state, &d)?;
         }
         Ok(state)
+    }
+
+    /// 작업본의 `delta`가 `head`의 첫 부모 체인(`stop` 커밋 앞까지)에 **확실히** 이미 들어 있는가.
+    ///
+    /// 끊긴 커밋의 작업본이 ref에는 이미 반영됐는데 WAL로 남아 다시 커밋을 시도하는 경우(결함 C)를 가려낸다.
+    /// 판별은 uuid가 근거다 — 요소 uuid는 추가 때 새로 만들어지므로 같은 uuid의 추가가 체인에 있으면
+    /// 그 작업본의 추가가 이미 커밋된 것이다. 다른 작업 공간이 먼저 커밋해 base가 바뀌어도 성립한다.
+    /// 확실한 경우만 `true`:
+    /// - delta 해시가 체인 커밋의 delta와 같다 (수정·삭제가 섞여도 같은 base 위라면 판별), 또는
+    /// - delta가 추가(노드·엣지)만으로 이뤄졌고, 추가한 요소가 하나도 빠짐없이 같은 내용으로 체인에 추가돼 있다.
+    ///
+    /// 그 밖(추가 없이 수정·삭제만 있는 작업본, 추가가 일부만 있거나 내용이 다름, 읽기 실패)은 `false`.
+    fn delta_already_in_chain(
+        ctx: &GraphCtx,
+        head: Hash256,
+        stop: Option<Hash256>,
+        delta: &Delta,
+    ) -> bool {
+        match Self::try_delta_in_chain(ctx, head, stop, delta) {
+            Ok(found) => found,
+            Err(e) => {
+                eprintln!(
+                    "vgraph: warn: 그래프 {} 반영 여부 판별 실패, 작업본을 그대로 둠: {e}",
+                    ctx.id
+                );
+                false
+            }
+        }
+    }
+
+    fn try_delta_in_chain(
+        ctx: &GraphCtx,
+        head: Hash256,
+        stop: Option<Hash256>,
+        delta: &Delta,
+    ) -> EngineResult<bool> {
+        if delta.is_empty() {
+            return Ok(false);
+        }
+        let want = delta.hash();
+        let adds_only = delta.nodes_removed.is_empty()
+            && delta.edges_removed.is_empty()
+            && delta.props_set.is_empty()
+            && delta.labels_delta.is_empty()
+            && delta.slugs_set.is_empty();
+        // 아직 체인에서 못 찾은 추가 요소 (uuid -> 내용)
+        let mut want_nodes: BTreeMap<Uuid, &vgraph_core::Node> = BTreeMap::new();
+        let mut want_edges: BTreeMap<Uuid, &vgraph_core::Edge> = BTreeMap::new();
+        if adds_only {
+            want_nodes.extend(delta.nodes_added.iter().map(|n| (n.uuid, n)));
+            want_edges.extend(delta.edges_added.iter().map(|e| (e.uuid, e)));
+        }
+        let mut cur = Some(head);
+        while let Some(h) = cur {
+            if stop == Some(h) {
+                break;
+            }
+            let bytes = ctx
+                .backend
+                .get_blob(&h)?
+                .ok_or(ResolveError::UnknownCommit)?;
+            let commit = Commit::from_json(
+                std::str::from_utf8(&bytes).map_err(|e| EngineError::Corrupt(e.to_string()))?,
+            )
+            .map_err(|e| EngineError::Corrupt(e.to_string()))?;
+            if commit.delta == want {
+                return Ok(true);
+            }
+            if adds_only {
+                let d = Self::load_delta(&ctx.backend, &commit.delta)?;
+                for n in &d.nodes_added {
+                    if want_nodes.get(&n.uuid).is_some_and(|w| **w == *n) {
+                        want_nodes.remove(&n.uuid);
+                    }
+                }
+                for e in &d.edges_added {
+                    if want_edges.get(&e.uuid).is_some_and(|w| **w == *e) {
+                        want_edges.remove(&e.uuid);
+                    }
+                }
+                if want_nodes.is_empty() && want_edges.is_empty() {
+                    return Ok(true);
+                }
+            }
+            cur = commit.parents.first().copied();
+        }
+        Ok(false)
+    }
+
+    /// 읽기 색인을 `state`(= `head`의 전체 상태)로 통째로 맞춘다: 전체 upsert + 상태에 없는 옛 rows 제거
+    /// + 워터마크를 `head`로. `upsert_head`가 재적용 안전(골든 K5)이라 중간에 끊겨도 다시 하면 된다.
+    ///
+    /// 쓰는 경우: 브랜치의 워터마크가 "이번에 반영하려는 커밋의 부모"가 아닐 때(권위 계층 ref는
+    /// 반영됐으나 파생 계층이 못 따라온 흔적). 이때 증분 delta만 얹으면 건너뛴 커밋이 rows에서 빠진다.
+    fn reflect_full(
+        ctx: &GraphCtx,
+        branch: &str,
+        state: &GraphState,
+        head: Hash256,
+    ) -> EngineResult<()> {
+        // payload 먼저: rows가 가리키는 내용이 항상 존재하게 한다 (put은 내용 주소라 멱등)
+        for n in state.nodes() {
+            ctx.backend
+                .put_payload(&payload_hash(&n.props), &props_json(&n.props))?;
+        }
+        for e in state.edges() {
+            ctx.backend
+                .put_payload(&payload_hash(&e.props), &props_json(&e.props))?;
+        }
+        let rows = LinkRows {
+            upsert_nodes: state
+                .nodes()
+                .map(|n| NodeRow {
+                    uuid: n.uuid,
+                    labels: n.labels.clone(),
+                    slug: n.slug.clone(),
+                    payload: payload_hash(&n.props),
+                })
+                .collect(),
+            remove_nodes: ctx
+                .backend
+                .scan_nodes(branch)?
+                .into_iter()
+                .map(|r| r.uuid)
+                .filter(|u| state.node(*u).is_none())
+                .collect(),
+            upsert_edges: state
+                .edges()
+                .map(|e| EdgeRow {
+                    uuid: e.uuid,
+                    etype: e.etype.clone(),
+                    from: e.from,
+                    to: e.to,
+                    payload: payload_hash(&e.props),
+                })
+                .collect(),
+            remove_edges: ctx
+                .backend
+                .scan_edges(branch)?
+                .into_iter()
+                .map(|r| r.uuid)
+                .filter(|u| state.edge(*u).is_none())
+                .collect(),
+            watermark: head,
+            ..Default::default()
+        };
+        ctx.backend.upsert_head(branch, &rows)?;
+        Ok(())
+    }
+
+    /// 그래프를 처음 열 때: 워터마크가 head와 다른 브랜치(커밋·병합이 ref 반영 뒤 끊긴 흔적)를
+    /// 처음부터 접어 head로 따라잡는다. 워터마크가 없는 브랜치는 첫 발행이 baseline을 만들므로 건드리지 않는다.
+    /// 한 브랜치가 실패해도 나머지는 계속하고, 첫 오류를 돌려준다.
+    fn catch_up_derived(&self, ctx: &GraphCtx) -> EngineResult<()> {
+        let mut first_err: Option<EngineError> = None;
+        for (branch, head) in ctx.backend.list_refs()? {
+            let behind = matches!(ctx.backend.watermark(&branch)?, Some(wm) if wm != head);
+            if !behind {
+                continue;
+            }
+            let result = Self::commit_chain(&ctx.backend, head)
+                .and_then(|chain| Self::fold_chain(ctx, &chain))
+                .and_then(|state| Self::reflect_full(ctx, &branch, &state, head));
+            if let Err(e) = result {
+                first_err.get_or_insert(e);
+            }
+        }
+        first_err.map_or(Ok(()), Err)
     }
 
     fn materialize_view(&self, ctx: &GraphCtx, target: Hash256) -> EngineResult<Arc<View>> {
@@ -897,6 +1087,12 @@ impl Session {
                             continue;
                         }
                     };
+                    // 끊긴 커밋의 작업본이 이미 ref에 반영돼 있으면 다시 얹지 않고 버린다 (결함 C):
+                    // 재배치하면 같은 uuid가 체인에 두 번 추가되거나 영구히 충돌한다.
+                    if Engine::delta_already_in_chain(&ctx, actual, w.base_commit, &cur_delta) {
+                        Self::cleanup(&ctx, &mut w, self.sid);
+                        return Ok(CommitOutcome::Empty);
+                    }
                     let theirs_state = self.engine.materialize_state(&ctx, actual)?;
                     let theirs_delta = diff(w.builder.base(), &theirs_state);
                     let items = detect_conflicts(&cur_delta, &theirs_delta);
@@ -939,7 +1135,14 @@ impl Session {
     }
 
     fn cleanup(ctx: &GraphCtx, w: &mut WorkInner, sid: u64) {
-        let _ = ctx.backend.drop_wal(w.wid);
+        // 정리 실패는 커밋 결과를 바꾸지 않는다 (ref는 이미 전진했다). 남은 작업본은 다음 `resume`/커밋에서
+        // "이미 체인에 있음"으로 판별돼 정리된다. 표준 출력은 MCP 프로토콜 채널이라 표준 오류에만 낸다.
+        if let Err(e) = ctx.backend.drop_wal(w.wid) {
+            eprintln!(
+                "vgraph: warn: 그래프 {} 작업본 {:?} 정리 실패(다음 호출에서 재시도): {e}",
+                ctx.id, w.wid
+            );
+        }
         if let Some(b) = &w.branch {
             let key = (b.clone(), w.workspace.clone(), sid);
             ctx.sessions.lock().unwrap().remove(&key);
@@ -955,16 +1158,22 @@ impl Session {
         delta: &Delta,
         chash: Hash256,
     ) -> EngineResult<()> {
-        self.publish_state(ctx, branch, &w.builder.work, delta, chash)
+        // 이 delta는 CAS의 기대값(w.base_commit) 위에 얹힌 것 — 증분 반영의 기준 부모
+        self.publish_state(ctx, branch, &w.builder.work, delta, w.base_commit, chash)
     }
 
     /// commit/merge 공용 발행 경로.
+    ///
+    /// `prior`는 `delta`가 얹힌 기준 커밋(커밋: CAS 기대값, 병합: 병합 전 dst head). 읽기 색인의 워터마크가
+    /// `prior`와 같을 때만 증분 반영한다. 다르면(ref는 반영됐으나 이전 발행이 끊긴 흔적) 건너뛴 커밋이
+    /// 있으므로 `work`(= `chash`의 전체 상태)로 통째 따라잡는다.
     fn publish_state(
         &self,
         ctx: &GraphCtx,
         branch: &str,
         work: &GraphState,
         delta: &Delta,
+        prior: Option<Hash256>,
         chash: Hash256,
     ) -> EngineResult<()> {
         let mut touched_nodes: BTreeSet<Uuid> = BTreeSet::new();
@@ -1007,75 +1216,81 @@ impl Session {
         // 브랜치 첫 발행(워터마크 없음)은 full baseline — 이후부터 증분.
         // (신규 브랜치의 lazy 구축이 여기서 완결. 부분 rows가 전체로 오인되는 것 방지)
         if self.engine.inner.opts.auto_upsert_head {
-            let first_publish = ctx.backend.watermark(branch)?.is_none();
-            let rows = if first_publish {
-                LinkRows {
-                    upsert_nodes: work
-                        .nodes()
-                        .map(|n| NodeRow {
-                            uuid: n.uuid,
-                            labels: n.labels.clone(),
-                            slug: n.slug.clone(),
-                            payload: payload_hash(&n.props),
-                        })
-                        .collect(),
-                    upsert_edges: work
-                        .edges()
-                        .map(|e| EdgeRow {
-                            uuid: e.uuid,
-                            etype: e.etype.clone(),
-                            from: e.from,
-                            to: e.to,
-                            payload: payload_hash(&e.props),
-                        })
-                        .collect(),
-                    watermark: chash,
-                    ..Default::default()
-                }
+            let watermark = ctx.backend.watermark(branch)?;
+            let first_publish = watermark.is_none();
+            if !first_publish && watermark != prior {
+                // 따라잡기: 워터마크가 기준 부모에 못 미침 — delta만 얹으면 건너뛴 커밋의 요소가 빠진다
+                Engine::reflect_full(ctx, branch, work, chash)?;
             } else {
-                LinkRows {
-                    upsert_nodes: touched_nodes
-                        .iter()
-                        .filter_map(|u| work.node(*u))
-                        .map(|n| NodeRow {
-                            uuid: n.uuid,
-                            labels: n.labels.clone(),
-                            slug: n.slug.clone(),
-                            payload: payload_hash(&n.props),
-                        })
-                        .collect(),
-                    remove_nodes: delta.nodes_removed.iter().map(|n| n.uuid).collect(),
-                    upsert_edges: touched_edges
-                        .iter()
-                        .filter_map(|u| work.edge(*u))
-                        .map(|e| EdgeRow {
-                            uuid: e.uuid,
-                            etype: e.etype.clone(),
-                            from: e.from,
-                            to: e.to,
-                            payload: payload_hash(&e.props),
-                        })
-                        .collect(),
-                    remove_edges: delta.edges_removed.iter().map(|e| e.uuid).collect(),
-                    adjacency: Vec::new(),
-                    remove_adjacency: Vec::new(),
-                    watermark: chash,
-                }
-            };
-            ctx.backend.upsert_head(branch, &rows)?;
-
-            // 첫 발행은 baseline 전체 payload 필요 (lazy 로드 재료) — 미기록분 보충
-            if first_publish {
-                for n in work.nodes() {
-                    if !touched_nodes.contains(&n.uuid) {
-                        ctx.backend
-                            .put_payload(&payload_hash(&n.props), &props_json(&n.props))?;
+                let rows = if first_publish {
+                    LinkRows {
+                        upsert_nodes: work
+                            .nodes()
+                            .map(|n| NodeRow {
+                                uuid: n.uuid,
+                                labels: n.labels.clone(),
+                                slug: n.slug.clone(),
+                                payload: payload_hash(&n.props),
+                            })
+                            .collect(),
+                        upsert_edges: work
+                            .edges()
+                            .map(|e| EdgeRow {
+                                uuid: e.uuid,
+                                etype: e.etype.clone(),
+                                from: e.from,
+                                to: e.to,
+                                payload: payload_hash(&e.props),
+                            })
+                            .collect(),
+                        watermark: chash,
+                        ..Default::default()
                     }
-                }
-                for e in work.edges() {
-                    if !touched_edges.contains(&e.uuid) {
-                        ctx.backend
-                            .put_payload(&payload_hash(&e.props), &props_json(&e.props))?;
+                } else {
+                    LinkRows {
+                        upsert_nodes: touched_nodes
+                            .iter()
+                            .filter_map(|u| work.node(*u))
+                            .map(|n| NodeRow {
+                                uuid: n.uuid,
+                                labels: n.labels.clone(),
+                                slug: n.slug.clone(),
+                                payload: payload_hash(&n.props),
+                            })
+                            .collect(),
+                        remove_nodes: delta.nodes_removed.iter().map(|n| n.uuid).collect(),
+                        upsert_edges: touched_edges
+                            .iter()
+                            .filter_map(|u| work.edge(*u))
+                            .map(|e| EdgeRow {
+                                uuid: e.uuid,
+                                etype: e.etype.clone(),
+                                from: e.from,
+                                to: e.to,
+                                payload: payload_hash(&e.props),
+                            })
+                            .collect(),
+                        remove_edges: delta.edges_removed.iter().map(|e| e.uuid).collect(),
+                        adjacency: Vec::new(),
+                        remove_adjacency: Vec::new(),
+                        watermark: chash,
+                    }
+                };
+                ctx.backend.upsert_head(branch, &rows)?;
+
+                // 첫 발행은 baseline 전체 payload 필요 (lazy 로드 재료) — 미기록분 보충
+                if first_publish {
+                    for n in work.nodes() {
+                        if !touched_nodes.contains(&n.uuid) {
+                            ctx.backend
+                                .put_payload(&payload_hash(&n.props), &props_json(&n.props))?;
+                        }
+                    }
+                    for e in work.edges() {
+                        if !touched_edges.contains(&e.uuid) {
+                            ctx.backend
+                                .put_payload(&payload_hash(&e.props), &props_json(&e.props))?;
+                        }
                     }
                 }
             }
@@ -1173,6 +1388,17 @@ impl Session {
             let op = EditOp::from_json(line).map_err(|e| EngineError::Corrupt(e.to_string()))?;
             op.apply(&mut builder.work)?;
         }
+        // 커밋이 ref까지 반영된 뒤 끊겨 이름만 남은 작업본이면 되살리지 않고 정리한다 (결함 C, 불변식 ⑥).
+        // 커밋 잠금 아래에서 판별해 진행 중인 커밋과 겹치지 않게 한다.
+        if let Some(branch) = &hdr.branch {
+            let _serial = ctx.commit_lock.lock().unwrap();
+            if let Some(head) = ctx.backend.get_ref(branch)? {
+                if Engine::delta_already_in_chain(&ctx, head, hdr.base, &builder.build()) {
+                    self.discard_reflected(&ctx, branch, &hdr, wid);
+                    return Err(EngineError::UnknownWorking);
+                }
+            }
+        }
         let es = EditSession {
             inner: Arc::new(Mutex::new(WorkInner {
                 graph: g,
@@ -1193,6 +1419,33 @@ impl Session {
                 .insert((b.clone(), hdr.workspace.clone(), self.sid), es.clone());
         }
         Ok(es)
+    }
+
+    /// 되살릴 수 없는 작업본(`resume`이 상태 오류를 낸 것)을 격리한다 — 소유자별 목록에서 빼되 내용은 남긴다.
+    /// 내 작업본만 격리할 수 있다(소유자 목록에 없으면 `UnknownWorking`). 반환 = 이번에 격리됐는지.
+    pub fn quarantine_working(&self, g: GraphId, wid: WorkingId) -> EngineResult<bool> {
+        let ctx = self.engine.ctx(g)?;
+        self.acl(&ctx)?;
+        if !ctx.backend.list_wals(&self.user)?.contains(&wid) {
+            return Err(EngineError::UnknownWorking);
+        }
+        Ok(ctx.backend.quarantine_wal(wid)?)
+    }
+
+    /// 이미 head 체인에 반영된 작업본의 WAL을 지우고, 같은 작업 공간의 낡은 열린 세션도 치운다.
+    /// WAL 삭제가 실패해도 경고만 낸다 — 남은 작업본은 다음 `resume`에서 같은 판별로 다시 정리된다.
+    fn discard_reflected(&self, ctx: &GraphCtx, branch: &str, hdr: &WalHeader, wid: WorkingId) {
+        if let Err(e) = ctx.backend.drop_wal(wid) {
+            eprintln!(
+                "vgraph: warn: 그래프 {} 이미 반영된 작업본 {wid:?} 정리 실패(다음 호출에서 재시도): {e}",
+                ctx.id
+            );
+        }
+        let key: SessionKey = (branch.to_string(), hdr.workspace.clone(), self.sid);
+        let stale = ctx.sessions.lock().unwrap().get(&key).cloned();
+        if stale.is_some_and(|es| es.inner.lock().unwrap().wid == wid) {
+            ctx.sessions.lock().unwrap().remove(&key);
+        }
     }
 
     // ---------- TestHooks (인터페이스 §3.4 — cfg(test) 전용은 아니나 문서상 계측 면) ----------
@@ -1491,7 +1744,7 @@ impl Session {
                     let hd_state = self.engine.materialize_state(&ctx, hd)?;
                     let hs_state = self.engine.materialize_state(&ctx, hs)?;
                     let d = diff(&hd_state, &hs_state);
-                    self.publish_state(&ctx, dst, &hs_state, &d, hs)?;
+                    self.publish_state(&ctx, dst, &hs_state, &d, Some(hd), hs)?;
                     ctx.emit(
                         dst,
                         GraphEvent::HeadAdvanced {
@@ -1610,7 +1863,7 @@ impl Session {
             .put_blob(&chash, commit.canonical_json().as_bytes())?;
         match ctx.backend.cas_ref(dst, Some(&hd), &chash)? {
             CasOutcome::Committed => {
-                self.publish_state(&ctx, dst, &merged, &merged_delta, chash)?;
+                self.publish_state(&ctx, dst, &merged, &merged_delta, Some(hd), chash)?;
                 ctx.emit(
                     dst,
                     GraphEvent::HeadAdvanced {

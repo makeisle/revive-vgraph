@@ -20,6 +20,7 @@ pub fn run_all<F: BackendFactory>(mk: impl Fn() -> F) {
     payload_insert_only_and_index(&mk());
     head_upsert_idempotent(&mk());
     wal_lifecycle(&mk());
+    wal_quarantine(&mk());
     watch_events(&mk());
     reopen_persistence(&mk());
 }
@@ -168,6 +169,36 @@ pub fn wal_lifecycle<F: BackendFactory>(f: &F) {
     b.drop_wal(w).unwrap();
     assert_eq!(b.read_wal(w).unwrap(), Vec::<String>::new());
     assert_eq!(b.list_wals("ceo").unwrap(), vec![]);
+}
+
+pub fn wal_quarantine<F: BackendFactory>(f: &F) {
+    let b = f.open();
+    let idg = TestIdGen::starting_at(190);
+    let (bad, other, absent) = (idg.next_working(), idg.next_working(), idg.next_working());
+    b.append_wal(bad, "ceo", r#"{"hdr":true}"#).unwrap();
+    b.append_wal(bad, "ceo", r#"{"op":"x"}"#).unwrap();
+    b.append_wal(other, "ceo", r#"{"op":"y"}"#).unwrap();
+    assert_eq!(b.list_wals("ceo").unwrap(), vec![bad, other]);
+
+    // 격리: 소유자별 목록에서 빠지고, 내용은 보존되며, 다른 작업본은 영향 없음
+    assert!(b.quarantine_wal(bad).unwrap());
+    assert_eq!(b.list_wals("ceo").unwrap(), vec![other]);
+    assert_eq!(
+        b.read_wal(bad).unwrap(),
+        vec![r#"{"hdr":true}"#, r#"{"op":"x"}"#]
+    );
+    assert_eq!(b.read_wal(other).unwrap(), vec![r#"{"op":"y"}"#]);
+    // 다른 소유자 목록에도 나타나지 않는다
+    assert_eq!(b.list_wals("guest").unwrap(), vec![]);
+    // 멱등: 이미 격리된 것은 변화 없음(false), 내용도 그대로
+    assert!(!b.quarantine_wal(bad).unwrap());
+    assert_eq!(b.read_wal(bad).unwrap().len(), 2);
+    // 없는 id: 오류 아님, false
+    assert!(!b.quarantine_wal(absent).unwrap());
+    assert_eq!(b.list_wals("ceo").unwrap(), vec![other]);
+    // 격리된 작업본도 삭제할 수 있다
+    b.drop_wal(bad).unwrap();
+    assert_eq!(b.read_wal(bad).unwrap(), Vec::<String>::new());
 }
 
 pub fn watch_events<F: BackendFactory>(f: &F) {
