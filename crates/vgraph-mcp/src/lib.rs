@@ -10,12 +10,12 @@
 
 use serde_json::{json, Value as J};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use vgraph_core::canon::{value_from_json, write_value};
 use vgraph_core::{
-    diff, GraphAddr, GraphId, Hash256, IdGen, NodeSel, Props, SystemIdGen, Uuid, Value,
+    diff, GraphAddr, GraphId, Hash256, IdGen, NodeSel, Props, SystemIdGen, Uuid, Value, WorkingId,
 };
 use vgraph_engine::interchange::{self, InterchangeError, ProblemCode};
 use vgraph_engine::view::{FindHit, FindOptions, FindOptionsError, TextFilter};
@@ -75,9 +75,62 @@ pub struct McpConfig {
     pub embed: EmbedSpec,
 }
 
+/// `vgraph_export`·`vgraph_import`의 `path`가 닿을 수 있는 곳.
+/// stdio 서버는 호출자가 곧 로컬 사용자이므로 제한이 없고(기본), 원격 `serve`는 교환 폴더 안으로 가둔다 —
+/// 안 그러면 원격 호출자가 데이터 폴더의 `server.stop`·`registry.jsonl` 등을 쓰고 읽을 수 있다.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum PathPolicy {
+    /// 어떤 경로든 그대로 쓴다 (stdio 기본).
+    #[default]
+    Unrestricted,
+    /// 이 폴더 안의 파일만 허용한다. 상대 경로는 이 폴더 기준으로 푼다.
+    ExchangeDir(PathBuf),
+}
+
+impl PathPolicy {
+    /// 호출자가 준 `path`를 실제로 열 경로로 바꾼다. 거부 문구에는 파일 내용이나 실제 경로를 싣지 않는다.
+    ///
+    /// 정규화(링크를 따라간 실제 위치)한 결과가 교환 폴더 안일 때만 통과한다. 없는 파일은 부모 폴더를
+    /// 정규화해 비교한다. 검사와 실제 열기 사이에 링크를 바꿔치기하는 경합은 막지 못한다(교환 폴더에
+    /// 쓸 수 있는 쪽이 없다는 전제).
+    pub fn resolve(&self, raw: &str) -> Result<PathBuf, String> {
+        let PathPolicy::ExchangeDir(dir) = self else {
+            return Ok(PathBuf::from(raw));
+        };
+        const DENIED: &str =
+            "path는 서버의 교환 폴더 안의 파일만 쓸 수 있습니다 (상대 경로는 교환 폴더 기준)";
+        if raw.is_empty() || raw.contains('\u{0}') {
+            return Err(DENIED.into());
+        }
+        let base = std::fs::canonicalize(dir)
+            .map_err(|_| "서버의 교환 폴더를 열 수 없습니다".to_string())?;
+        let joined = base.join(raw);
+        let resolved = match std::fs::canonicalize(&joined) {
+            Ok(real) => real,
+            Err(_) => {
+                // 끊어진 링크는 정규화에 실패하지만 이미 무언가가 있는 자리다 — 따라가지 않고 거부한다.
+                if std::fs::symlink_metadata(&joined).is_ok() {
+                    return Err(DENIED.into());
+                }
+                let name = joined.file_name().ok_or_else(|| DENIED.to_string())?;
+                let parent = joined.parent().ok_or_else(|| DENIED.to_string())?;
+                let parent = std::fs::canonicalize(parent).map_err(|_| DENIED.to_string())?;
+                parent.join(name)
+            }
+        };
+        if resolved != base && resolved.starts_with(&base) {
+            Ok(resolved)
+        } else {
+            Err(DENIED.into())
+        }
+    }
+}
+
 pub struct McpServer {
     engine: Engine,
     cfg: McpConfig,
+    /// `path` 인자 정책. 기본은 제한 없음 — `McpConfig`는 구조체 리터럴로 만들어지므로 필드를 더하지 않는다.
+    path_policy: PathPolicy,
     embedder: Option<Box<dyn Embedder>>,
     /// 신원을 지정하지 않은 호출(`handle_message`·`handle_line`)이 쓰는 서버 기본 신원.
     /// `McpConfig`는 외부 구조체 리터럴이라 필드를 더하지 않고 여기에 둔다.
@@ -347,6 +400,7 @@ impl McpServer {
             cfg,
             embedder,
             identity,
+            path_policy: PathPolicy::default(),
             uploads: Mutex::new(Uploads::new(UploadLimits::default())),
         })
     }
@@ -360,8 +414,16 @@ impl McpServer {
             cfg,
             embedder,
             identity,
+            path_policy: PathPolicy::default(),
             uploads: Mutex::new(Uploads::new(UploadLimits::default())),
         }
+    }
+
+    /// 내보내기·가져오기 `path`의 허용 범위를 정한다. 원격 `serve`가 교환 폴더로 가둘 때 쓴다.
+    #[must_use]
+    pub fn with_path_policy(mut self, policy: PathPolicy) -> Self {
+        self.path_policy = policy;
+        self
     }
 
     /// 나눠 올리기(`vgraph_import`의 `upload`) 상한을 바꾼다. 기본값은 [`UploadLimits::default`].
@@ -620,7 +682,7 @@ impl McpServer {
     fn t_edit(&self, id: &Identity, a: &J) -> Result<J, String> {
         let sess = self.sess(id);
         let (g, branch, _) = target_of(&sess, s(a, "graph")?)?;
-        let es = open_work(&sess, g, &branch, id.workspace())?;
+        let (es, warnings) = open_work(&sess, g, &branch, id.workspace())?;
         let ops = a
             .get("ops")
             .and_then(|o| o.as_array())
@@ -635,11 +697,13 @@ impl McpServer {
             results.push(r);
         }
         let d = es.pending();
-        Ok(json!({
+        let mut out = json!({
             "applied": results.len(), "results": results,
             "pending": delta_summary(&d),
             "hint": "vgraph_commit으로 확정 (working copy는 호출 간 유지됨)",
-        }))
+        });
+        attach_recovery_warnings(&mut out, warnings);
+        Ok(out)
     }
 
     /// Ref 값 정규화 + 조기 검증 (UX-1·UX-2): 축약 "ns/slug#node" → graph:// 보정,
@@ -762,40 +826,45 @@ impl McpServer {
     fn t_pending(&self, id: &Identity, a: &J) -> Result<J, String> {
         let sess = self.sess(id);
         let (g, branch, _) = target_of(&sess, s(a, "graph")?)?;
-        match find_work(&sess, g, &branch, id.workspace()).map_err(ee)? {
-            None => Ok(json!({ "working": null })),
+        let (found, warnings) = find_work(&sess, g, &branch, id.workspace()).map_err(ee)?;
+        let mut out = match found {
+            None => json!({ "working": null }),
             Some(es) => {
                 let d = es.pending();
-                Ok(json!({
+                json!({
                     "working": es.wid().to_string(),
                     "base": es.base().map(|h| h.to_string()),
                     "pending": delta_summary(&d),
-                }))
+                })
             }
-        }
+        };
+        attach_recovery_warnings(&mut out, warnings);
+        Ok(out)
     }
 
     fn t_commit(&self, id: &Identity, a: &J) -> Result<J, String> {
         let sess = self.sess(id);
         let (g, branch, _) = target_of(&sess, s(a, "graph")?)?;
-        let es = find_work(&sess, g, &branch, id.workspace())
-            .map_err(ee)?
-            .ok_or("working copy 없음 — 먼저 vgraph_edit로 변경을 쌓으세요")?;
-        Ok(commit_outcome_j(
-            sess.commit(&es, s(a, "message")?).map_err(ee)?,
-        ))
+        let (found, warnings) = find_work(&sess, g, &branch, id.workspace()).map_err(ee)?;
+        let es = found.ok_or("working copy 없음 — 먼저 vgraph_edit로 변경을 쌓으세요")?;
+        let mut out = commit_outcome_j(sess.commit(&es, s(a, "message")?).map_err(ee)?);
+        attach_recovery_warnings(&mut out, warnings);
+        Ok(out)
     }
 
     fn t_discard(&self, id: &Identity, a: &J) -> Result<J, String> {
         let sess = self.sess(id);
         let (g, branch, _) = target_of(&sess, s(a, "graph")?)?;
-        match find_work(&sess, g, &branch, id.workspace()).map_err(ee)? {
-            None => Ok(json!({ "discarded": false })),
+        let (found, warnings) = find_work(&sess, g, &branch, id.workspace()).map_err(ee)?;
+        let mut out = match found {
+            None => json!({ "discarded": false }),
             Some(es) => {
                 sess.discard(es).map_err(ee)?;
-                Ok(json!({ "discarded": true }))
+                json!({ "discarded": true })
             }
-        }
+        };
+        attach_recovery_warnings(&mut out, warnings);
+        Ok(out)
     }
 
     fn t_branch(&self, id: &Identity, a: &J) -> Result<J, String> {
@@ -1071,21 +1140,90 @@ fn target_of(sess: &Session, x: &str) -> Result<(GraphId, String, Option<NodeSel
     Ok((g, a.branch.as_deref().unwrap_or("main").to_string(), a.node))
 }
 
+/// 되살릴 수 없어 격리한 작업본 하나에 대한 경고 (응답의 `recovery_warnings` 항목).
+fn quarantine_warning(wid: WorkingId, kind: &str, quarantined: bool) -> J {
+    let message = if quarantined {
+        "되살릴 수 없는 작업본을 격리했습니다(내용은 보존, 이후 목록에서 제외). 새 작업본으로 이어 씁니다."
+    } else {
+        "되살릴 수 없는 작업본을 만났으나 격리하지 못했습니다. 새 작업본으로 이어 씁니다."
+    };
+    json!({
+        "code": "working_quarantined",
+        "working": wid.to_string(),
+        "error": kind,
+        "quarantined": quarantined,
+        "message": message,
+    })
+}
+
+/// 되살리기 오류를 "작업본 자체가 되살릴 수 없는 상태"로 볼지. 저장소 입출력 오류(`Store`)처럼
+/// 일시적일 수 있는 것은 격리하지 않는다(멀쩡한 작업본을 잃지 않도록).
+fn resume_error_kind(e: &EngineError) -> Option<&'static str> {
+    match e {
+        EngineError::Corrupt(_) => Some("corrupt"),
+        EngineError::State(_) => Some("state"),
+        EngineError::Resolve(_) => Some("resolve"),
+        EngineError::Store(_) | EngineError::BranchExists | EngineError::BadBranchName(_) => None,
+        EngineError::Link(_) | EngineError::UnknownWorking => None,
+    }
+}
+
+/// 같은 브랜치·작업 공간의 내 작업본을 찾는다. 되살릴 수 없는 작업본은 삼키지 않고
+/// 표준 오류에 경고 한 줄 + 격리 + 응답 경고로 드러낸다. 반환 = (찾은 작업본, 경고들).
+///
+/// `UnknownWorking`은 `resume`이 "이미 head 체인에 반영된 남은 작업본"을 스스로 정리했거나
+/// 비어 있다는 뜻이다(engine.rs `resume`) — 정상 정리이므로 격리도 경고도 하지 않고 다음 후보로 간다.
 fn find_work(
     sess: &Session,
     g: GraphId,
     branch: &str,
     ws: Option<&str>,
-) -> EngineResult<Option<EditSession>> {
+) -> EngineResult<(Option<EditSession>, Vec<J>)> {
+    let mut warnings = Vec::new();
     for wid in sess.list_working(g)? {
-        if let Ok(es) = sess.resume(g, wid) {
-            // 브랜치와 작업 공간 이름이 모두 같은 것만 (미지정 = 이름 없는 것만)
-            if es.branch().as_deref() == Some(branch) && es.workspace().as_deref() == ws {
-                return Ok(Some(es));
+        match sess.resume(g, wid) {
+            Ok(es) => {
+                // 브랜치와 작업 공간 이름이 모두 같은 것만 (미지정 = 이름 없는 것만)
+                if es.branch().as_deref() == Some(branch) && es.workspace().as_deref() == ws {
+                    return Ok((Some(es), warnings));
+                }
+            }
+            Err(EngineError::UnknownWorking) => {}
+            Err(e) => {
+                let Some(kind) = resume_error_kind(&e) else {
+                    eprintln!("vgraph: warn: 작업본 {wid} 되살리기 실패({e}) — 일시적 오류일 수 있어 격리하지 않고 건너뜀");
+                    continue;
+                };
+                let quarantined = match sess.quarantine_working(g, wid) {
+                    Ok(done) => done,
+                    Err(qe) => {
+                        eprintln!("vgraph: warn: 작업본 {wid} 격리 실패({qe})");
+                        false
+                    }
+                };
+                eprintln!(
+                    "vgraph: warn: 작업본 {wid} 되살리기 실패({e}) — {}",
+                    if quarantined {
+                        "격리함"
+                    } else {
+                        "격리하지 못함"
+                    }
+                );
+                warnings.push(quarantine_warning(wid, kind, quarantined));
             }
         }
     }
-    Ok(None)
+    Ok((None, warnings))
+}
+
+/// 응답 객체에 격리 경고를 싣는다. 경고가 없으면 아무 필드도 더하지 않는다(기존 응답 구조 불변).
+fn attach_recovery_warnings(out: &mut J, warnings: Vec<J>) {
+    if warnings.is_empty() {
+        return;
+    }
+    if let Some(o) = out.as_object_mut() {
+        o.insert("recovery_warnings".into(), J::Array(warnings));
+    }
 }
 
 fn open_work(
@@ -1093,12 +1231,13 @@ fn open_work(
     g: GraphId,
     branch: &str,
     ws: Option<&str>,
-) -> Result<EditSession, String> {
-    if let Some(es) = find_work(sess, g, branch, ws).map_err(ee)? {
-        return Ok(es);
+) -> Result<(EditSession, Vec<J>), String> {
+    let (found, warnings) = find_work(sess, g, branch, ws).map_err(ee)?;
+    if let Some(es) = found {
+        return Ok((es, warnings));
     }
     match sess.edit_in(g, branch, ws) {
-        Ok(es) => Ok(es),
+        Ok(es) => Ok((es, warnings)),
         Err(EditStartError::Engine(e)) => Err(ee(e)),
         Err(EditStartError::NotHead { .. }) => Err("과거 commit 편집은 MCP v0 미지원".into()),
     }
@@ -1739,14 +1878,19 @@ impl McpServer {
         if max.is_some() || cursor.is_some() {
             return self.t_export_part(id, a, max, cursor);
         }
+        // 쓸 곳을 먼저 검사한다 — 거부될 요청이 그래프를 읽느라 시간을 쓰지 않게.
+        let target = match opt_str(a, "path")? {
+            Some(path) => Some((path, self.path_policy.resolve(path)?)),
+            None => None,
+        };
         let sess = self.sess(id);
         let ex = interchange::export(&sess, s(a, "graph")?).map_err(interchange_err)?;
         let mut out = json!({
             "epoch": ex.epoch.to_string(), "nodes": ex.nodes, "edges": ex.edges,
         });
-        match opt_str(a, "path")? {
-            Some(path) => {
-                ex.write_to(Path::new(path)).map_err(interchange_err)?;
+        match target {
+            Some((path, real)) => {
+                ex.write_to(&real).map_err(interchange_err)?;
                 out["path"] = json!(path);
             }
             None => {
@@ -1843,7 +1987,8 @@ impl McpServer {
             }
             (Some(_), None) => return Err("document는 객체 또는 JSON 문자열이어야 합니다".into()),
             (None, Some(path)) => {
-                interchange::read_document(Path::new(path)).map_err(interchange_err)?
+                let real = self.path_policy.resolve(path)?;
+                interchange::read_document(&real).map_err(interchange_err)?
             }
             _ => return Err("document와 path 중 정확히 하나를 주세요".into()),
         };

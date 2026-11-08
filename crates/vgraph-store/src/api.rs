@@ -137,6 +137,10 @@ pub trait WalStore {
     fn read_wal(&self, w: WorkingId) -> StoreResult<Vec<String>>;
     fn list_wals(&self, owner: &str) -> StoreResult<Vec<WorkingId>>;
     fn drop_wal(&self, w: WorkingId) -> StoreResult<()>;
+    /// 되살릴 수 없는 작업본을 소유자별 목록(`list_wals`)에서 빼되 내용은 보존한다 (격리).
+    /// `read_wal(w)`은 격리 뒤에도 같은 줄을 돌려준다. 반환 = 이번 호출로 격리됐으면 `true`
+    /// (없는 id이거나 이미 격리돼 있으면 `false` — 오류 아님, 멱등). 스키마·내용은 바꾸지 않는다.
+    fn quarantine_wal(&self, w: WorkingId) -> StoreResult<bool>;
 }
 
 // ---------- 구독 ----------

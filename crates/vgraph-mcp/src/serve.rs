@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as Process, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
-use vgraph_mcp::{Identity, McpServer};
+use vgraph_mcp::{Identity, McpServer, PathPolicy};
 
 use crate::{build_server, service, tokens, CommonArgs, DEFAULT_ROOT};
 
@@ -140,6 +140,11 @@ pub struct ServeSettings {
     /// 목록에 없는 Origin 은 403 이다. Origin 을 보내지 않는 클라이언트는 영향 없다. 루프백 서버에는 쓸 수 없다
     #[arg(long = "allow-origin", value_name = "출처")]
     allow_origin: Vec<String>,
+    /// 내보내기·가져오기(vgraph_export/vgraph_import)의 path가 닿을 수 있는 유일한 폴더
+    /// (기본: <데이터 폴더>/exchange). 상대 경로는 이 폴더 기준이고, 밖의 경로는 거부된다.
+    /// 데이터 폴더 자신이나 그 상위 폴더는 쓸 수 없다
+    #[arg(long, value_name = "폴더")]
+    exchange_dir: Option<PathBuf>,
 }
 
 /// `ServeSettings::validate`가 확인을 마치고 넘기는 값. 토큰 값·TLS 설정(개인키 포함)이 있어 `Debug`를 파생하지 않는다.
@@ -191,7 +196,37 @@ pub fn absolute(path: &Path) -> anyhow::Result<PathBuf> {
         .map_err(|e| anyhow::anyhow!("절대 경로로 바꿀 수 없습니다: {}: {e}", path.display()))
 }
 
+/// 교환 폴더 기본 이름 (데이터 폴더 바로 아래).
+const EXCHANGE_DIR_NAME: &str = "exchange";
+
 impl ServeSettings {
+    /// 원격 호출자의 `path`를 가둘 교환 폴더를 만들고 경로 정책으로 돌려준다.
+    /// 데이터 폴더가 교환 폴더와 같거나 그 안이면 가두는 의미가 없어 거절한다.
+    fn exchange_policy(&self) -> anyhow::Result<PathPolicy> {
+        let root = fs::canonicalize(&self.common.root).map_err(|e| {
+            anyhow::anyhow!(
+                "데이터 폴더를 확인할 수 없습니다: {}: {e}",
+                self.common.root.display()
+            )
+        })?;
+        let dir = match &self.exchange_dir {
+            Some(d) => absolute(d)?,
+            None => root.join(EXCHANGE_DIR_NAME),
+        };
+        fs::create_dir_all(&dir)
+            .map_err(|e| anyhow::anyhow!("교환 폴더를 만들 수 없습니다: {}: {e}", dir.display()))?;
+        let dir = fs::canonicalize(&dir).map_err(|e| {
+            anyhow::anyhow!("교환 폴더를 확인할 수 없습니다: {}: {e}", dir.display())
+        })?;
+        if root.starts_with(&dir) {
+            anyhow::bail!(
+                "교환 폴더({})는 데이터 폴더와 같거나 그 상위일 수 없습니다 — 데이터 폴더의 파일이 노출됩니다",
+                dir.display()
+            );
+        }
+        Ok(PathPolicy::ExchangeDir(dir))
+    }
+
     pub fn has_inline_token(&self) -> bool {
         self.token.is_some()
     }
@@ -273,6 +308,12 @@ impl ServeSettings {
             v.push("--no-embed-fallback".to_string());
         }
         v.extend(["--listen".to_string(), self.listen.to_string()]);
+        if let Some(dir) = &self.exchange_dir {
+            v.extend([
+                "--exchange-dir".to_string(),
+                path_text(&absolute(dir)?)?.to_string(),
+            ]);
+        }
         if let Some(token) = &self.token {
             v.extend(["--token".to_string(), token.clone()]);
         }
@@ -504,7 +545,8 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
     remove_if_present(&paths.info)?;
     remove_if_present(&paths.stop)?;
 
-    let server = Arc::new(build_server(settings.common)?);
+    let path_policy = settings.exchange_policy()?;
+    let server = Arc::new(build_server(settings.common)?.with_path_policy(path_policy));
     let router = Arc::new(Router::new(Arc::clone(&server), default_user));
     let mut opts = HttpOptions::new(listen)
         .forward_header(USER_HEADER)
